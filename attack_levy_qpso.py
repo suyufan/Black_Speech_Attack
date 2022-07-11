@@ -133,9 +133,11 @@ class Attack:
         # return new audios and new cost
         return new_input, cl
 
+
 def highpass_filter(data, cutoff=7000, fs=16000, order=10):
     b, a = butter(order, cutoff / (0.5 * fs), btype='high', analog=False)
     return lfilter(b, a, data)
+
 
 def mutate_audio(audio, num, mutation_range):
     audios = []
@@ -241,13 +243,12 @@ class PSOEnvironment():
             if (i + 1) % 10 == 0:
                 print_toggle = True
 
+            decoded = self.ds.stt(self.gbest_position.astype(np.int16), 16000)
+            corr = "{0:.4f}".format(np.corrcoef(audio, self.gbest_position)[0][1])  # 皮尔逊相关系数
             dist = levenshteinDistance(decoded, self.target)
             # Update the particle position
             self.update(print_toggle, i, dist)
 
-
-            decoded = self.ds.stt(self.gbest_position.astype(np.int16), 16000)
-            corr = "{0:.4f}".format(np.corrcoef(audio, self.gbest_position)[0][1])  # 皮尔逊相关系数
             print(
                 "Current decoded word: " + decoded + "\t" + "Cost: " + str(
                     self.global_min_cost))
@@ -340,6 +341,7 @@ class PSOEnvironment():
         new_input, cl = self.attack.attack(audios, self.lengths,
                                            [[toks.index(x) for x in self.target]] * len(audios),
                                            print_toggle)
+
     #
     def build_model(self, model_path):
 
@@ -434,5 +436,6 @@ def main():
         else:
             print('Not totally a success! Consider running for more iterations. Intermediate output stored as',
                   out_wav_file)
+
 
 main()
