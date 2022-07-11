@@ -202,12 +202,13 @@ class PSOEnvironment():
         self.pop_size = num_particle
 
         # 梯度估计
+        self.pop = np.expand_dims(audio, axis=0)
+        self.pop = np.tile(self.pop, (self.pop_size, 1))
         self.num_points_estimate = 100
         self.delta_for_gradient = 100
         self.elite_size = 10
-        self.funcs = self.setup_graph(self.pop, np.array([toks.index(x) for x in target_phrase]))
 
-        restore_path = model_path + "/model.v0.4.1"
+        self.restore_path = model_path + "/model.v0.4.1"
 
         audios = []
 
@@ -222,7 +223,7 @@ class PSOEnvironment():
         maxlen = max(map(len, audios))
         audios = np.array([x + [0] * (maxlen - len(x)) for x in audios])
 
-        self.attack = Attack(sess, len(target), maxlen, batch_size=len(audios), restore_path=restore_path)
+        self.attack = Attack(sess, len(target), maxlen, batch_size=len(audios), restore_path=self.restore_path)
         new_input, cl = self.attack.attack(audios, self.lengths, [[toks.index(x) for x in self.target]] * len(audios),
                                            True)
         self.elite_pop = new_input
@@ -238,6 +239,8 @@ class PSOEnvironment():
         self.gbest_position = new_input[optimal_index][0]
         print("================================================")
         print("global best position: " + str(self.gbest_position))
+        print("----------------self.particles------", self.pop)
+        self.funcs = self.setup_graph(self.pop, np.array([toks.index(x) for x in target]))
 
     def setup_graph(self, input_audio_batch, target_phrase):
         batch_size = input_audio_batch.shape[0]
@@ -258,13 +261,13 @@ class PSOEnvironment():
             len_seq = tf.placeholder(tf.int32, shape=seq_len.shape, name='f')
 
             logits = get_logits(inputs, arg2_logits)
-            target = ctc_label_dense_to_sparse(arg1_dense, arg2_dense, len_batch)
+            target = ctc_label_dense_to_sparse(arg1_dense, arg2_dense)
             ctcloss = tf.nn.ctc_loss(labels=tf.cast(target, tf.int32), inputs=logits, sequence_length=len_seq)
             decoded, _ = tf.nn.ctc_greedy_decoder(logits, arg2_logits, merge_repeated=True)
 
             sess = tf.Session()
             saver = tf.train.Saver(tf.global_variables())
-            saver.restore(sess, restore_path)
+            saver.restore(sess, self.restore_path)
 
         func1 = lambda a, b, c, d, e, f: sess.run(ctcloss,
                                                   feed_dict={inputs: a, len_batch: b, arg2_logits: c, arg1_dense: d,
@@ -391,7 +394,7 @@ class PSOEnvironment():
         mutation_population = self.pop_size
         if t < 10:
             self.levy(audios)
-        elif t > 10 & dist > 2:
+        elif t > 10 & dist > 4:
             self.QPSO(t, audios)
             flag = "true"
             # # 变异操作
