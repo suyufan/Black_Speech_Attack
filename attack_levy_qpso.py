@@ -405,7 +405,7 @@ def main():
     with tf.Session() as sess:
         audios = []
         lengths = []
-
+        
         # Load the inputs that we're given
         fs, audio = wav.read(args.input)
         assert fs == 16000
