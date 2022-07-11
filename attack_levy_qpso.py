@@ -201,6 +201,12 @@ class PSOEnvironment():
         self.ds = self.build_model(model_path)
         self.pop_size = num_particle
 
+        # 梯度估计
+        self.num_points_estimate = 100
+        self.delta_for_gradient = 100
+        self.elite_size = 10
+        self.funcs = self.setup_graph(self.pop, np.array([toks.index(x) for x in target_phrase]))
+
         restore_path = model_path + "/model.v0.4.1"
 
         audios = []
@@ -230,6 +236,43 @@ class PSOEnvironment():
         # np.where()以元组的形式输出满足条件元素的坐标
         optimal_index = np.where(cl == min(cl))
         self.gbest_position = new_input[optimal_index][0]
+        print("================================================")
+        print("global best position: " + str(self.gbest_position))
+
+    def setup_graph(self, input_audio_batch, target_phrase):
+        batch_size = input_audio_batch.shape[0]
+        weird = (input_audio_batch.shape[1] - 1) // 320
+        logits_arg2 = np.tile(weird, batch_size)
+        dense_arg1 = np.array(np.tile(target_phrase, (batch_size, 1)), dtype=np.int32)
+        dense_arg2 = np.array(np.tile(target_phrase.shape[0], batch_size), dtype=np.int32)
+
+        pass_in = np.clip(input_audio_batch, -2 ** 15, 2 ** 15 - 1)
+        seq_len = np.tile(weird, batch_size).astype(np.int32)
+
+        with tf.variable_scope('', reuse=tf.AUTO_REUSE):
+            inputs = tf.placeholder(tf.float32, shape=pass_in.shape, name='a')
+            len_batch = tf.placeholder(tf.float32, name='b')
+            arg2_logits = tf.placeholder(tf.int32, shape=logits_arg2.shape, name='c')
+            arg1_dense = tf.placeholder(tf.float32, shape=dense_arg1.shape, name='d')
+            arg2_dense = tf.placeholder(tf.int32, shape=dense_arg2.shape, name='e')
+            len_seq = tf.placeholder(tf.int32, shape=seq_len.shape, name='f')
+
+            logits = get_logits(inputs, arg2_logits)
+            target = ctc_label_dense_to_sparse(arg1_dense, arg2_dense, len_batch)
+            ctcloss = tf.nn.ctc_loss(labels=tf.cast(target, tf.int32), inputs=logits, sequence_length=len_seq)
+            decoded, _ = tf.nn.ctc_greedy_decoder(logits, arg2_logits, merge_repeated=True)
+
+            sess = tf.Session()
+            saver = tf.train.Saver(tf.global_variables())
+            saver.restore(sess, restore_path)
+
+        func1 = lambda a, b, c, d, e, f: sess.run(ctcloss,
+                                                  feed_dict={inputs: a, len_batch: b, arg2_logits: c, arg1_dense: d,
+                                                             arg2_dense: e, len_seq: f})
+        func2 = lambda a, b, c, d, e, f: sess.run([ctcloss, decoded],
+                                                  feed_dict={inputs: a, len_batch: b, arg2_logits: c, arg1_dense: d,
+                                                             arg2_dense: e, len_seq: f})
+        return (func1, func2)
 
     def print_positions(self):
         for particle in self.particles:
@@ -286,6 +329,7 @@ class PSOEnvironment():
             stepsize = lamuda * step * (particle.position - self.gbest_position)
             particle.position = particle.position + stepsize * np.random.randn(
                 len(particle.position), )  # 产生满足正态分布的序列
+            particle.move_particle()
             audios.append(particle.position)
         return audios
 
@@ -309,42 +353,86 @@ class PSOEnvironment():
                 particle.position = pi + math.log(1 / u) * B * abs(np.array(mbest - particle.position))
             else:
                 particle.position = pi - math.log(1 / u) * B * abs(np.array(mbest - particle.position))
+            particle.move_particle()
             audios.append(particle.position)
         return audios
+
+    def getctcloss(self, input_audio_batch, target_phrase, decode=False):
+        batch_size = input_audio_batch.shape[0]
+        weird = (input_audio_batch.shape[1] - 1) // 320
+        logits_arg2 = np.tile(weird, batch_size)
+        dense_arg1 = np.array(np.tile(target_phrase, (batch_size, 1)), dtype=np.int32)
+        dense_arg2 = np.array(np.tile(target_phrase.shape[0], batch_size), dtype=np.int32)
+
+        pass_in = np.clip(input_audio_batch, -2 ** 15, 2 ** 15 - 1)
+        seq_len = np.tile(weird, batch_size).astype(np.int32)
+
+        if decode:
+            return self.funcs[1](pass_in, batch_size, logits_arg2, dense_arg1, dense_arg2, seq_len)
+        else:
+            return self.funcs[0](pass_in, batch_size, logits_arg2, dense_arg1, dense_arg2, seq_len)
+
+    def get_fitness_score(self, input_audio_batch, target_phrase, input_audio, classify=False):
+        target_enc = np.array([toks.index(x) for x in target_phrase])
+        if classify:
+            ctcloss, decoded = self.getctcloss(input_audio_batch, target_enc, decode=True)
+            all_text = "".join([toks[x] for x in decoded[0].values])
+            index = len(all_text) // input_audio_batch.shape[0]
+            final_text = all_text[:index]
+        else:
+            ctcloss = self.getctcloss(input_audio_batch, target_enc)
+        score = -ctcloss
+        if classify:
+            return (score, final_text)
+        return score, -ctcloss
 
     def update(self, print_toggle, t, audio, dist):
         audios = []
         mutation_population = self.pop_size
-
-        if dist > 2:
-            # 变异操作
-            mutated_audios, mutated_lengths = mutate_audio(audio, mutation_population, 150, self.elite_pop)
-
-            audios.extend(mutated_audios)
-        #             self.lengths.extend(mutated_lengths)
-
-        # if t < 10:
-        #     self.levy(audios)
-        else:
+        if t < 10:
+            self.levy(audios)
+        elif t > 10 & dist > 2:
             self.QPSO(t, audios)
-            # update my particles
-            for i, particle in enumerate(self.particles):
-                # 极值更新
-                if cl[i] < particle.min_cost:
-                    particle.min_cost = cl[i]
-                    particle.pbest_position = new_input[i]
+            flag = "true"
+            # # 变异操作
+            # mutated_audios, mutated_lengths = mutate_audio(audio, mutation_population, 150, self.elite_pop)
+            #
+            # audios.extend(mutated_audios)
 
-                if cl[i] < self.global_min_cost:
-                    self.gbest_position = new_input[i]
-                    self.global_min_cost = cl[i]
-        # else:
-        #     self.levy(audios)
+        else:
+            pop_scores, ctc = self.get_fitness_score(self.particles, self.target, audio)
+            elite_ind = np.argsort(pop_scores)[-self.elite_size:]
+            elite_pop, elite_pop_scores, elite_ctc = self.pop[elite_ind], pop_scores[elite_ind], ctc[elite_ind]
+
+            perturbed = np.tile(np.expand_dims(elite_pop[-1], axis=0), (self.num_points_estimate, 1))
+            indices = np.random.choice(audios.shape[1], size=self.num_points_estimate, replace=False)
+
+            perturbed[np.arange(self.num_points_estimate), indices] += self.delta_for_gradient
+            perturbed_scores = self.get_fitness_score(perturbed, self.target, self.audio)[0]
+
+            grad = (perturbed_scores - elite_ctc[-1]) / self.delta_for_gradient
+            grad /= np.abs(grad).max()
+            modified = elite_pop[-1].copy()
+            modified[indices] += grad * self.delta_for_perturbation
+
+            self.particles = np.tile(np.expand_dims(modified, axis=0), (self.pop_size, 1))
+            self.delta_for_perturbation *= 0.995
 
         # calculate new cost
         # 迭代10次 print_toggle为true 为true之后计算Current decoded word (without language model):以及Average loss: %.3f"
         new_input, cl = self.attack.attack(audios, self.lengths,
                                            [[toks.index(x) for x in self.target]] * len(audios),
                                            print_toggle)
+        # update my particles
+        for i, particle in enumerate(self.particles):
+            # 极值更新
+            if cl[i] < particle.min_cost:
+                particle.min_cost = cl[i]
+                particle.pbest_position = new_input[i]
+
+            if cl[i] < self.global_min_cost:
+                self.gbest_position = new_input[i]
+                self.global_min_cost = cl[i]
 
     #
     def build_model(self, model_path):
@@ -394,8 +482,6 @@ class Particle():
 # Instantiate the PSOEnvironment class
 # Iterate the attack using the PSOEnvironment object
 def main():
-    mutation_range = 100
-
     parser = argparse.ArgumentParser(description=None)
     parser.add_argument('--input', type=str, dest="input",
                         required=True,
