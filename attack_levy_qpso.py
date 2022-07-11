@@ -26,6 +26,7 @@ import DeepSpeech
 
 from tensorflow.python.keras.backend import ctc_label_dense_to_sparse
 from tf_logits import get_logits
+from scipy.signal import butter, lfilter
 
 # These are the tokens that we're allowed to use.
 # The - token is special and corresponds to the epsilon
@@ -139,17 +140,18 @@ def highpass_filter(data, cutoff=7000, fs=16000, order=10):
     return lfilter(b, a, data)
 
 
-def mutate_audio(audio, num, mutation_range):
+def mutate_audio(audio, num, mutation_range, elite_pop):
     audios = []
     lengths = []
-    noise = np.random.randn(audio) * 40
+    noise = np.random.randn(*audio.shape) * 40
     noise = highpass_filter(noise)
     for i in range(num):
-        wn = np.random.randint(-mutation_range, mutation_range, size=len(audio), dtype=np.int16)
-        mutated_audio = audio + wn
+        #         wn = np.random.randint(-mutation_range, mutation_range, size=len(audio), dtype=np.int16)
+        #         mutated_audio = audio + wn
+        mask = np.random.rand(audio.shape[0], elite_pop.shape[1]) < 0.005
+        mutated_audio = audio + mask * noise
         audios.append(list(mutated_audio))
         lengths.append(len(mutated_audio))
-
     return audios, lengths
 
 
@@ -217,7 +219,7 @@ class PSOEnvironment():
         self.attack = Attack(sess, len(target), maxlen, batch_size=len(audios), restore_path=restore_path)
         new_input, cl = self.attack.attack(audios, self.lengths, [[toks.index(x) for x in self.target]] * len(audios),
                                            True)
-
+        self.elite_pop = new_input
         # Instantiating the particles
         self.particles = []
         for i in range(num_particle):
@@ -246,8 +248,9 @@ class PSOEnvironment():
             decoded = self.ds.stt(self.gbest_position.astype(np.int16), 16000)
             corr = "{0:.4f}".format(np.corrcoef(audio, self.gbest_position)[0][1])  # 皮尔逊相关系数
             dist = levenshteinDistance(decoded, self.target)
+
             # Update the particle position
-            self.update(print_toggle, i, dist)
+            self.update(print_toggle, i, audio, dist)
 
             print(
                 "Current decoded word: " + decoded + "\t" + "Cost: " + str(
@@ -309,16 +312,17 @@ class PSOEnvironment():
             audios.append(particle.position)
         return audios
 
-    def update(self, print_toggle, t, dist):
+    def update(self, print_toggle, t, audio, dist):
         audios = []
-        crossover_population = int(0.2 * self.pop_size)
-        mutation_population = self.pop_size - (2 * crossover_population)
+        mutation_population = self.pop_size
 
         if dist > 2:
             # 变异操作
-            mutated_audios, mutated_lengths = mutate_audio(audio, mutation_population, 150)
+            mutated_audios, mutated_lengths = mutate_audio(audio, mutation_population, 150, self.elite_pop)
+
             audios.extend(mutated_audios)
-            self.lengths.extend(mutated_lengths)
+        #             self.lengths.extend(mutated_lengths)
+
         # if t < 10:
         #     self.levy(audios)
         else:
@@ -416,7 +420,7 @@ def main():
     with tf.Session() as sess:
         audios = []
         lengths = []
-        
+
         # Load the inputs that we're given
         fs, audio = wav.read(args.input)
         assert fs == 16000
