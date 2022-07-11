@@ -134,10 +134,16 @@ class Attack:
         return new_input, cl
 
 
+def highpass_filter(data, cutoff=7000, fs=16000, order=10):
+    b, a = butter(order, cutoff / (0.5 * fs), btype='high', analog=False)
+    return lfilter(b, a, data)
+
+
 def mutate_audio(audio, num, mutation_range):
     audios = []
     lengths = []
-    
+    noise = np.random.randn(audio) * 40
+    noise = highpass_filter(noise)
     for i in range(num):
         wn = np.random.randint(-mutation_range, mutation_range, size=len(audio), dtype=np.int16)
         mutated_audio = audio + wn
@@ -221,11 +227,7 @@ class PSOEnvironment():
         self.global_min_cost = min(cl)
         # np.where()以元组的形式输出满足条件元素的坐标
         optimal_index = np.where(cl == min(cl))
-        print("================================================")
-        print("new_input: ", new_input.shape)
         self.gbest_position = new_input[optimal_index][0]
-        print("================================================")
-        print("global best position: " + str(self.gbest_position))
 
     def print_positions(self):
         for particle in self.particles:
@@ -240,19 +242,18 @@ class PSOEnvironment():
             print("Iteration: " + str(i))
             if (i + 1) % 10 == 0:
                 print_toggle = True
-            # Update the particle position
-            self.update(print_toggle, i)
 
             decoded = self.ds.stt(self.gbest_position.astype(np.int16), 16000)
-            dist = levenshteinDistance(decoded, self.target)
             corr = "{0:.4f}".format(np.corrcoef(audio, self.gbest_position)[0][1])  # 皮尔逊相关系数
+            dist = levenshteinDistance(decoded, self.target)
+            # Update the particle position
+            self.update(print_toggle, i, dist)
+
             print(
                 "Current decoded word: " + decoded + "\t" + "Cost: " + str(
                     self.global_min_cost))
-            # Save and output the audio file
-            out_wav_file = 'levy_qpso_adv.wav'
-            wav.write(out_wav_file, 16000, self.gbest_position.astype(np.int16))
             print('output dB', db(self.gbest_position))  # 信噪比SNR
+            print('dist', dist)  # 编辑距离
 
             if log is not None:
                 log.write(str(i) + ", " + str(self.global_min_cost) + ", " + str(dist) + ", " + str(
@@ -260,6 +261,9 @@ class PSOEnvironment():
             if (decoded == self.target):
                 return True
                 break
+        # Save and output the audio file
+        out_wav_file = 'levy_qpso_adv.wav'
+        wav.write(out_wav_file, 16000, self.gbest_position.astype(np.int16))
 
     def levy(self, audios):
         # Levy flights by Mantegna 's algorithm
@@ -305,31 +309,38 @@ class PSOEnvironment():
             audios.append(particle.position)
         return audios
 
-    def update(self, print_toggle, t):
+    def update(self, print_toggle, t, dist):
         audios = []
-        if t < 10:
-            self.levy(audios)
-        elif t < 40:
-            self.QPSO(t, audios)
+        crossover_population = int(0.2 * self.pop_size)
+        mutation_population = self.pop_size - (2 * crossover_population)
+
+        if dist > 2:
+            # 变异操作
+            mutated_audios, mutated_lengths = mutate_audio(audio, mutation_population, 150)
+            audios.extend(mutated_audios)
+            self.lengths.extend(mutated_lengths)
+        # if t < 10:
+        #     self.levy(audios)
         else:
-            self.levy(audios)
+            self.QPSO(t, audios)
+            # update my particles
+            for i, particle in enumerate(self.particles):
+                # 极值更新
+                if cl[i] < particle.min_cost:
+                    particle.min_cost = cl[i]
+                    particle.pbest_position = new_input[i]
+
+                if cl[i] < self.global_min_cost:
+                    self.gbest_position = new_input[i]
+                    self.global_min_cost = cl[i]
+        # else:
+        #     self.levy(audios)
 
         # calculate new cost
         # 迭代10次 print_toggle为true 为true之后计算Current decoded word (without language model):以及Average loss: %.3f"
         new_input, cl = self.attack.attack(audios, self.lengths,
                                            [[toks.index(x) for x in self.target]] * len(audios),
                                            print_toggle)
-
-        # update my particles
-        for i, particle in enumerate(self.particles):
-            # 极值更新
-            if cl[i] < particle.min_cost:
-                particle.min_cost = cl[i]
-                particle.pbest_position = new_input[i]
-
-            if cl[i] < self.global_min_cost:
-                self.gbest_position = new_input[i]
-                self.global_min_cost = cl[i]
 
     #
     def build_model(self, model_path):
@@ -399,7 +410,7 @@ def main():
 
     population_size = args.population
     model_path = "deepspeech-0.4.1-checkpoint"
-    iterations = 71
+    iterations = 1000
     target = args.target
 
     with tf.Session() as sess:
@@ -425,5 +436,6 @@ def main():
         else:
             print('Not totally a success! Consider running for more iterations. Intermediate output stored as',
                   out_wav_file)
+
 
 main()
