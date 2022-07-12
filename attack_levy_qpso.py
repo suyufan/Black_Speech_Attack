@@ -19,14 +19,45 @@ import sys
 import time
 
 sys.path.append("DeepSpeech")
+from scipy.signal import butter, lfilter
 
+tf.load_op_library = lambda x: x
+generation_tmp = os.path.exists
+os.path.exists = lambda x: True
+
+
+class Wrapper:
+    def __init__(self, d):
+        self.d = d
+
+    def __getattr__(self, x):
+        return self.d[x]
+
+
+class HereBeDragons:
+    d = {}
+    FLAGS = Wrapper(d)
+
+    def __getattr__(self, x):
+        return self.do_define
+
+    def do_define(self, k, v, *x):
+        self.d[k] = v
+
+
+tf.app.flags = HereBeDragons()
 import DeepSpeech
 
 # 5.13 跑 python attack_pso.py --input sample_input.wav --target "and you know" --population 50  47.64s
+os.path.exists = generation_tmp
 
-from tensorflow.python.keras.backend import ctc_label_dense_to_sparse
-from tf_logits import get_logits
-from scipy.signal import butter, lfilter
+# More monkey-patching, to stop the training coordinator setup
+DeepSpeech.TrainingCoordinator.__init__ = lambda x: None
+DeepSpeech.TrainingCoordinator.start = lambda x: None
+
+from util.text import ctc_label_dense_to_sparse
+from tf_logits import compute_mfcc, get_logits
+
 
 # These are the tokens that we're allowed to use.
 # The - token is special and corresponds to the epsilon
@@ -130,10 +161,10 @@ class Attack:
             print("Current decoded word (without language model): " + str(res[optimal_index[0][0]]))
             # np.mean(a)求a的平均值
             print("Average loss: %.3f" % np.mean(cl) + "\n")
-
-        # return new audios and new cost
-        return new_input, cl
-
+            return new_input, cl, str(res[optimal_index[0][0]])
+        else:
+            # return new audios and new cost
+            return new_input, cl
 
 def highpass_filter(data, cutoff=7000, fs=16000, order=10):
     b, a = butter(order, cutoff / (0.5 * fs), btype='high', analog=False)
@@ -194,6 +225,7 @@ class PSOEnvironment():
     def __init__(self, num_particle, audio, model_path, target, iterations, sess):
 
         self.global_min_cost = float('inf')
+        self.input_audio = audio
         self.gbest_position = audio
         self.target = target
         self.iterations = iterations
@@ -210,22 +242,23 @@ class PSOEnvironment():
 
         self.restore_path = model_path + "/model.v0.4.1"
 
-        audios = []
+        self.audios = []
 
         # To create the first set of particles here
         # Creating first set of mutation
-        for _ in range(num_particle):
+        for _ in range(self.pop_size):
             wn = np.random.randint(-200, 200, size=len(audio), dtype=np.int16)
             mutated_audio = audio + wn
-            audios.append(list(mutated_audio))
+            self.audios.append(list(mutated_audio))
             self.lengths.append(len(mutated_audio))
 
         maxlen = max(map(len, audios))
-        audios = np.array([x + [0] * (maxlen - len(x)) for x in audios])
+        self.audios = np.array([x + [0] * (maxlen - len(x)) for x in audios])
 
-        self.attack = Attack(sess, len(target), maxlen, batch_size=len(audios), restore_path=self.restore_path)
-        new_input, cl = self.attack.attack(audios, self.lengths, [[toks.index(x) for x in self.target]] * len(audios),
-                                           True)
+        # self.attack = Attack(sess, len(target), maxlen, batch_size=len(audios), restore_path=self.restore_path)
+        # new_input, cl = self.attack.attack(audios, self.lengths, [[toks.index(x) for x in self.target]] * len(audios),
+        #                                    True)
+        new_input, score, cl = self.get_fitness_score(self.gbest_position, self.target, audio)
         self.elite_pop = new_input
         # Instantiating the particles
         self.particles = []
@@ -239,82 +272,92 @@ class PSOEnvironment():
         self.gbest_position = new_input[optimal_index][0]
         print("================================================")
         print("global best position: " + str(self.gbest_position))
-        print("----------------self.particles------", self.pop)
-        self.funcs = self.setup_graph(self.pop, np.array([toks.index(x) for x in target]))
 
-    def setup_graph(self, input_audio_batch, target_phrase):
-        batch_size = input_audio_batch.shape[0]
-        weird = (input_audio_batch.shape[1] - 1) // 320
-        logits_arg2 = np.tile(weird, batch_size)
-        dense_arg1 = np.array(np.tile(target_phrase, (batch_size, 1)), dtype=np.int32)
-        dense_arg2 = np.array(np.tile(target_phrase.shape[0], batch_size), dtype=np.int32)
-
-        pass_in = np.clip(input_audio_batch, -2 ** 15, 2 ** 15 - 1)
-        seq_len = np.tile(weird, batch_size).astype(np.int32)
-
-        with tf.variable_scope('', reuse=tf.AUTO_REUSE):
-            inputs = tf.placeholder(tf.float32, shape=pass_in.shape, name='a')
-            len_batch = tf.placeholder(tf.float32, name='b')
-            arg2_logits = tf.placeholder(tf.int32, shape=logits_arg2.shape, name='c')
-            arg1_dense = tf.placeholder(tf.float32, shape=dense_arg1.shape, name='d')
-            arg2_dense = tf.placeholder(tf.int32, shape=dense_arg2.shape, name='e')
-            len_seq = tf.placeholder(tf.int32, shape=seq_len.shape, name='f')
-
-            logits = get_logits(inputs, arg2_logits)
-            target = ctc_label_dense_to_sparse(arg1_dense, arg2_dense)
-            ctcloss = tf.nn.ctc_loss(labels=tf.cast(target, tf.int32), inputs=logits, sequence_length=len_seq)
-            decoded, _ = tf.nn.ctc_greedy_decoder(logits, arg2_logits, merge_repeated=True)
-
-            sess = tf.Session()
-            saver = tf.train.Saver(tf.global_variables())
-            saver.restore(sess, self.restore_path)
-
-        func1 = lambda a, b, c, d, e, f: sess.run(ctcloss,
-                                                  feed_dict={inputs: a, len_batch: b, arg2_logits: c, arg1_dense: d,
-                                                             arg2_dense: e, len_seq: f})
-        func2 = lambda a, b, c, d, e, f: sess.run([ctcloss, decoded],
-                                                  feed_dict={inputs: a, len_batch: b, arg2_logits: c, arg1_dense: d,
-                                                             arg2_dense: e, len_seq: f})
-        return (func1, func2)
+    def get_fitness_score(self, input_audio_batch, target_phrase, input_audio, classify=False):
+        target_enc = np.array([toks.index(x) for x in target_phrase])
+        if classify:
+            self.attack = Attack(sess, len(target), maxlen, batch_size=len(audios), restore_path=restore_path)
+            new_input, ctcloss, decoded = self.attack.attack(audios, self.lengths, [[toks.index(x) for x in self.target]] * len(audios), True)
+            all_text = "".join([toks[x] for x in decoded[0].values])
+            index = len(all_text) // input_audio_batch.shape[0]
+            final_text = all_text[:index]
+        else:
+            new_input, ctcloss = self.attack.attack(audios, self.lengths, [[toks.index(x) for x in self.target]] * len(audios), False)
+        score = -ctcloss
+        if classify:
+            return (new_input, score, final_text)
+        return (new_input, score, -ctcloss)
 
     def print_positions(self):
         for particle in self.particles:
             particle.__str__()
 
     def print_best_audio(self, audio, log=None):
+        max_fitness_score = float('-inf')
+        dist = float('inf')
+        decoded = ''
+        itr = 1
+
         if log is not None:
             log.write('target phrase: ' + self.target + '\n')
             log.write('itr, loss, dist, corr, db, decoded \n')
-        for i in range(self.iterations):
+
+        while itr <= self.max_iters and decoded != self.target_phrase:
+            new_input, pop_scores, ctc = self.get_fitness_score(self.pop, self.target, self.input_audio)
+            elite_ind = np.argsort(pop_scores)[-self.elite_size:]
+            elite_pop, elite_pop_scores, elite_ctc = self.pop[elite_ind], pop_scores[elite_ind], ctc[elite_ind]
+
             print_toggle = False
-            print("Iteration: " + str(i))
-            if (i + 1) % 10 == 0:
+
+            if itr % 10 == 0:
+                print('**************************** ITERATION {} ****************************'.format(i))
                 print_toggle = True
+                # 本来的编码方式
+                decoded = self.ds.stt(self.gbest_position.astype(np.int16), 16000)
+                # Black的编码方式
+                best_pop = np.tile(np.expand_dims(self.gbest_position, axis=0), (100, 1))
+                _,_, best_text = self.get_fitness_score(best_pop, self.target_phrase, self.input_audio, classify=True)
+                print("---------------Black编码方式--------------",best_text)
 
-            decoded = self.ds.stt(self.gbest_position.astype(np.int16), 16000)
-            corr = "{0:.4f}".format(np.corrcoef(audio, self.gbest_position)[0][1])  # 皮尔逊相关系数
-            dist = levenshteinDistance(decoded, self.target)
+                corr = "{0:.4f}".format(np.corrcoef(audio, self.gbest_position)[0][1])  # 皮尔逊相关系数
+                dist = levenshteinDistance(decoded, self.target)
 
-            # Update the particle position
-            self.update(print_toggle, i, audio, dist)
+                print(
+                    "Current decoded word: " + decoded + "\t" + "Cost: " + str(
+                        self.global_min_cost))
+                print('output dB', db(self.gbest_position))  # 信噪比SNR
+                print('dist', dist)  # 编辑距离
 
-            print(
-                "Current decoded word: " + decoded + "\t" + "Cost: " + str(
-                    self.global_min_cost))
-            print('output dB', db(self.gbest_position))  # 信噪比SNR
-            print('dist', dist)  # 编辑距离
+                # Save and output the audio file
+                out_wav_file = 'levy_qpso_adv.wav'
+                wav.write(out_wav_file, 16000, self.gbest_position.astype(np.int16))
 
-            if log is not None:
-                log.write(str(i) + ", " + str(self.global_min_cost) + ", " + str(dist) + ", " + str(
-                    corr) + ", " + str(db(self.gbest_position)) + ", " + decoded + "\n")
-            if (decoded == self.target):
-                return True
-                break
-        # Save and output the audio file
-        out_wav_file = 'levy_qpso_adv.wav'
-        wav.write(out_wav_file, 16000, self.gbest_position.astype(np.int16))
+                if log is not None:
+                    log.write(str(i) + ", " + str(self.global_min_cost) + ", " + str(dist) + ", " + str(
+                        corr) + ", " + str(db(self.gbest_position)) + ", " + decoded + "\n")
 
-    def levy(self, audios):
+            if dist > 4:
+                self.update(print_toggle, i, dist)
+            else:
+                perturbed = np.tile(np.expand_dims(elite_pop[-1], axis=0), (self.num_points_estimate, 1))
+                indices = np.random.choice(audios.shape[1], size=self.num_points_estimate, replace=False)
+
+                perturbed[np.arange(self.num_points_estimate), indices] += self.delta_for_gradient
+                new_input, perturbed_scores = self.get_fitness_score(perturbed, self.target, self.input_audio)[0]
+
+                grad = (perturbed_scores - elite_ctc[-1]) / self.delta_for_gradient
+                grad /= np.abs(grad).max()
+                modified = elite_pop[-1].copy()
+                modified[indices] += grad * self.delta_for_perturbation
+
+                self.particles = np.tile(np.expand_dims(modified, axis=0), (self.pop_size, 1))
+                self.delta_for_perturbation *= 0.995
+            itr += 1
+        return itr < self.max_iters
+
+
+    def levy(self):
+        audios= []
         # Levy flights by Mantegna 's algorithm
         beta = 1.5
         alpha = 1
@@ -336,7 +379,8 @@ class PSOEnvironment():
             audios.append(particle.position)
         return audios
 
-    def QPSO(self, t, audios):
+    def QPSO(self, t):
+        audios = []
         # QPSO algorithm
         # 计算mbest
         global sum_mbest
@@ -360,72 +404,26 @@ class PSOEnvironment():
             audios.append(particle.position)
         return audios
 
-    def getctcloss(self, input_audio_batch, target_phrase, decode=False):
-        batch_size = input_audio_batch.shape[0]
-        weird = (input_audio_batch.shape[1] - 1) // 320
-        logits_arg2 = np.tile(weird, batch_size)
-        dense_arg1 = np.array(np.tile(target_phrase, (batch_size, 1)), dtype=np.int32)
-        dense_arg2 = np.array(np.tile(target_phrase.shape[0], batch_size), dtype=np.int32)
-
-        pass_in = np.clip(input_audio_batch, -2 ** 15, 2 ** 15 - 1)
-        seq_len = np.tile(weird, batch_size).astype(np.int32)
-
-        if decode:
-            return self.funcs[1](pass_in, batch_size, logits_arg2, dense_arg1, dense_arg2, seq_len)
-        else:
-            return self.funcs[0](pass_in, batch_size, logits_arg2, dense_arg1, dense_arg2, seq_len)
-
-    def get_fitness_score(self, input_audio_batch, target_phrase, input_audio, classify=False):
-        target_enc = np.array([toks.index(x) for x in target_phrase])
-        if classify:
-            ctcloss, decoded = self.getctcloss(input_audio_batch, target_enc, decode=True)
-            all_text = "".join([toks[x] for x in decoded[0].values])
-            index = len(all_text) // input_audio_batch.shape[0]
-            final_text = all_text[:index]
-        else:
-            ctcloss = self.getctcloss(input_audio_batch, target_enc)
-        score = -ctcloss
-        if classify:
-            return (score, final_text)
-        return score, -ctcloss
-
-    def update(self, print_toggle, t, audio, dist):
-        audios = []
+    def update(self, print_toggle, t, dist):
         mutation_population = self.pop_size
+
         if t < 10:
-            self.levy(audios)
-        elif t > 10 & dist > 4:
-            self.QPSO(t, audios)
-            flag = "true"
+            audios = self.levy()
+        elif t < 50 :
+            audios = self.QPSO(t)
             # # 变异操作
             # mutated_audios, mutated_lengths = mutate_audio(audio, mutation_population, 150, self.elite_pop)
             #
             # audios.extend(mutated_audios)
 
         else:
-            pop_scores, ctc = self.get_fitness_score(self.particles, self.target, audio)
-            elite_ind = np.argsort(pop_scores)[-self.elite_size:]
-            elite_pop, elite_pop_scores, elite_ctc = self.pop[elite_ind], pop_scores[elite_ind], ctc[elite_ind]
+            audios = self.levy()
 
-            perturbed = np.tile(np.expand_dims(elite_pop[-1], axis=0), (self.num_points_estimate, 1))
-            indices = np.random.choice(audios.shape[1], size=self.num_points_estimate, replace=False)
-
-            perturbed[np.arange(self.num_points_estimate), indices] += self.delta_for_gradient
-            perturbed_scores = self.get_fitness_score(perturbed, self.target, self.audio)[0]
-
-            grad = (perturbed_scores - elite_ctc[-1]) / self.delta_for_gradient
-            grad /= np.abs(grad).max()
-            modified = elite_pop[-1].copy()
-            modified[indices] += grad * self.delta_for_perturbation
-
-            self.particles = np.tile(np.expand_dims(modified, axis=0), (self.pop_size, 1))
-            self.delta_for_perturbation *= 0.995
 
         # calculate new cost
         # 迭代10次 print_toggle为true 为true之后计算Current decoded word (without language model):以及Average loss: %.3f"
         new_input, cl = self.attack.attack(audios, self.lengths,
-                                           [[toks.index(x) for x in self.target]] * len(audios),
-                                           print_toggle)
+                                               [[toks.index(x) for x in self.target]] * len(audios), print_toggle)
         # update my particles
         for i, particle in enumerate(self.particles):
             # 极值更新
